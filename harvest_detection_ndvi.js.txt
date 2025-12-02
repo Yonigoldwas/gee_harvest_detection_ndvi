@@ -1,0 +1,298 @@
+
+/***************************************************************
+ Harvest detection (Corn & Soy) — pick the single MGRS tile that
+ overlaps your drawn geometry the most, then run EVERYTHING on
+ that tile (no clipping; use full tile footprints).
+****************************************************************/
+
+
+// ===================== USER PARAMETERS ======================
+var preStart   = '2024-09-10';   // window 1 start
+var preEnd     = '2024-09-30';   // window 1 end
+var postStart  = '2024-10-10';   // window 2 start
+var postEnd    = '2024-10-30';   // window 2 end
+
+// NDVI logic thresholds
+var preMinNDVI   = 0.55;     // green before
+var postMaxNDVI  = 0.25;     // bare after
+var ndviDropThr  = -0.1;    // post - pre <= -0.25
+
+// S2 Cloud Probability threshold (0–100)
+var cloudProbThresh = 40;     // lower = stricter masking
+
+// Patch filtering (despeckle)
+var minPatchPixels = 20;      // 10 m pixels (~0.2 ha)
+
+// CDL year
+var cdlYear = 2024;
+
+// Optional: consider NDVI only on corn+soy pixels
+var maskNDVIToCrops = false;
+
+// Export settings
+var exportScale  = 10;
+var exportFolder = 'GEE_Harvest_IL';
+// ============================================================
+
+
+// -------------------- INPUT GEOMETRY -------------------------
+// Draw a polygon called `geometry` in the Code Editor. We will
+// use it ONLY to choose the tile; calculations use the full tile.
+Map.centerObject(geometry, 9);
+
+
+// -------------------- CDL: get cropland band (no clipping) ---
+function getCdlForYear(year) {
+  var start = ee.Date.fromYMD(year, 1, 1);
+  var end   = start.advance(1, 'year');
+  var col   = ee.ImageCollection('USDA/NASS/CDL').filterDate(start, end);
+
+  var cdlImg = ee.Image(ee.Algorithms.If(col.size().gt(0), col.first(), null));
+  // Fallback to 2023 if needed
+  cdlImg = ee.Image(ee.Algorithms.If(
+    cdlImg,
+    cdlImg,
+    ee.ImageCollection('USDA/NASS/CDL')
+      .filterDate('2023-01-01', '2024-01-01')
+      .first()
+  ));
+
+  var bandName = ee.String(ee.Algorithms.If(
+    cdlImg.bandNames().contains('cropland'),
+    'cropland',
+    cdlImg.bandNames().get(0)
+  ));
+
+  return ee.Image(cdlImg).select(bandName); // NOTE: no clip here
+}
+
+var cdl = getCdlForYear(cdlYear);
+var cornMask = cdl.eq(1);  // Corn
+var soyMask  = cdl.eq(5);  // Soybeans
+var cropMask = cornMask.or(soyMask);
+
+
+// -------------------- PICK THE BIGGEST-OVERLAP TILE ----------
+var allStart = (preStart < postStart) ? preStart : postStart;
+var allEnd   = (preEnd   > postEnd)   ? preEnd   : postEnd;
+
+var s2Any = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterDate(allStart, allEnd);
+
+// Tiles that touch your geometry
+var tiles = ee.List(
+  s2Any.filterBounds(geometry).aggregate_array('MGRS_TILE')
+).distinct();
+
+// For each tile, area( geometry ∩ union(footprints) ); pick max
+var tileAreasFC = ee.FeatureCollection(tiles.map(function(t) {
+  t = ee.String(t);
+  var tileGeomUnion = s2Any.filter(ee.Filter.eq('MGRS_TILE', t)).geometry(); // union of tile footprints
+  var inter = tileGeomUnion.intersection(geometry, ee.ErrorMargin(1));
+  var area = inter.area(1); // m²
+  return ee.Feature(null, {tile: t, area_m2: area});
+}));
+
+var biggest    = tileAreasFC.sort('area_m2', false).first();
+var chosenTile = ee.String(biggest.get('tile'));
+var chosenAreaHa = ee.Number(biggest.get('area_m2')).divide(10000);
+
+print('Chosen MGRS tile:', chosenTile, 'overlap with your geometry (ha):', chosenAreaHa);
+
+// For stats/exports, we’ll still need the tile union geometry (not for clipping, just for region)
+var tileGeom = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterDate(allStart, allEnd)
+  .filter(ee.Filter.eq('MGRS_TILE', chosenTile))
+  .geometry();
+
+Map.addLayer(ee.Image().byte().paint(tileGeom, 1, 2), {palette: ['cyan']}, 'Chosen tile outline', false);
+
+// -------------------- CLEANEST NDVI FOR THE TILE -------------
+function cleanestNDVIForTile(start, end, tileId, time) {
+  tileId = ee.String(tileId);
+
+  var s2  = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+              .filterDate(start, end)
+              .filter(ee.Filter.eq('MGRS_TILE', tileId))
+              .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 90));
+
+  var s2cp = ee.ImageCollection('COPERNICUS/S2_CLOUD_PROBABILITY')
+              .filterDate(start, end)
+              .filter(ee.Filter.eq('MGRS_TILE', tileId));
+
+  // Join by system:index
+  var joined = ee.ImageCollection(ee.Join.saveFirst('clouds').apply(
+    s2, s2cp, ee.Filter.equals({leftField: 'system:index', rightField: 'system:index'})
+  ));
+
+  // Evaluate clear fraction over the union geometry of *this tile in this window*
+  var tileGeomWindow = s2.geometry();
+
+  var withCP = joined.filter(ee.Filter.notNull(['clouds'])).map(function(img) {
+    var cp = ee.Image(img.get('clouds')).select('probability').rename('cloudprob');
+    var clear = cp.lt(cloudProbThresh).rename('clear');
+    var frac = ee.Number(clear.reduceRegion({
+      reducer: ee.Reducer.mean(), geometry: tileGeomWindow, scale: 20, maxPixels: 1e9
+    }).get('clear'));
+    return img.addBands(cp).set('tile_clear_frac', frac);
+  });
+
+  var hasCP = withCP.size().gt(0);
+  var selected = ee.Image(ee.Algorithms.If(
+    hasCP,
+    withCP.sort('tile_clear_frac', false).first(),
+    s2.sort('CLOUDY_PIXEL_PERCENTAGE').first()
+  ));
+
+  // Build NDVI and RGB with same mask do not clip keep full tile footprint
+  var ndviRgb = ee.Image(ee.Algorithms.If(selected, (function() {
+    var img  = ee.Image(selected);
+
+    var ndviImg = img.normalizedDifference(['B8', 'B4']).rename('NDVI');
+
+    var useCP = img.bandNames().contains('cloudprob');
+    var mask = ee.Image(ee.Algorithms.If(
+      useCP,
+      img.select('cloudprob').lt(cloudProbThresh),
+      img.select('QA60').bitwiseAnd(1 << 10).eq(0)
+        .and(img.select('QA60').bitwiseAnd(1 << 11).eq(0))
+    ));
+
+    ndviImg = ndviImg.updateMask(mask);
+
+    // RGB from B4 B3 B2 with same mask
+    var rgb = img.select(['B4', 'B3', 'B2']).rename(['R', 'G', 'B']).updateMask(mask);
+
+    return ndviImg.addBands(rgb)
+      .set({
+        'selected_id': img.id(),
+        'selected_date': ee.Date(img.get('system:time_start')).format('YYYY-MM-dd'),
+        'mask_method': ee.String(ee.Algorithms.If(useCP, 'S2_CLOUD_PROB', 'QA60')),
+        'cloudy_pixel_percentage': img.get('CLOUDY_PIXEL_PERCENTAGE')
+      });
+  })(),
+  // Case of no scene in window return empty NDVI and RGB
+  ee.Image.cat(
+    ee.Image(0).rename('NDVI').updateMask(ee.Image(0)),
+    ee.Image(0).rename('R').updateMask(ee.Image(0)),
+    ee.Image(0).rename('G').updateMask(ee.Image(0)),
+    ee.Image(0).rename('B').updateMask(ee.Image(0))
+  )));
+
+  // Debug
+  print(time + ' window', start, 'to', end, 'tile', tileId, 'scenes:', s2.size());
+  print(time + ' selected scene meta:',
+        ndviRgb.get('selected_id'),
+        ndviRgb.get('selected_date'),
+        ndviRgb.get('mask_method'),
+        ndviRgb.get('cloudy_pixel_percentage'));
+
+  return ndviRgb;
+}
+
+
+// -------------------- BUILD PRE/POST (FULL TILE) -------------
+var preNDVIRGB  = cleanestNDVIForTile(preStart,  preEnd,  chosenTile, 'Pre');
+var postNDVIRGB = cleanestNDVIForTile(postStart, postEnd, chosenTile, 'Post');
+
+var preNDVI  = preNDVIRGB.select('NDVI')
+var postNDVI = postNDVIRGB.select('NDVI')
+
+
+var ndviDiff = postNDVI.subtract(preNDVI).rename('dNDVI');
+
+// Optional: restrict NDVI to crop pixels (still no clipping; just masking)
+if (maskNDVIToCrops) {
+  preNDVI  = preNDVI.updateMask(cropMask);
+  postNDVI = postNDVI.updateMask(cropMask);
+  ndviDiff = postNDVI.subtract(preNDVI).rename('dNDVI');
+}
+
+
+// -------------------- HARVEST LOGIC --------------------------
+var condPreGreen = preNDVI.gte(preMinNDVI);
+var condPostBare = postNDVI.lte(postMaxNDVI);
+var condDrop     = ndviDiff.lte(ndviDropThr);
+
+var harvestCandidate = condPreGreen.and(condPostBare).and(condDrop);
+
+// Apply crop-specific masks (no clip; mask intersects with NDVI footprint naturally)
+var harvestCorn = harvestCandidate.updateMask(cornMask);
+var harvestSoy  = harvestCandidate.updateMask(soyMask);
+
+// Despeckle
+function minPatch(img, minPix) {
+  var labeled = img.selfMask().connectedPixelCount(100, true);
+  return img.updateMask(labeled.gte(minPix));
+}
+harvestCorn = minPatch(harvestCorn, minPatchPixels);
+harvestSoy  = minPatch(harvestSoy,  minPatchPixels);
+
+// Class image: 0 none, 1=corn, 2=soy
+var harvestClass = ee.Image(0).rename('harvest')
+  .where(harvestCorn, 1)
+  .where(harvestSoy,  2)
+  .clip(tileGeom)
+  //.clip(geometry)
+
+
+// -------------------- VISUALIZATION --------------------------
+var ndviViz = {min: -0.2, max: 0.9, palette: ['#5b3a1e','#d4b66d','#4dac26']};
+var dViz = {min: -0.6, max: 0.6, palette: ['#a50026','#f46d43','#fee08b','#e0f3f8','#74add1','#313695']};
+var classViz = {min: 0, max: 2, palette: ['00000000', '#ff3b30', '#34c759']};
+var RGBvisualization = {
+  min: 0,
+  max: 3000,
+  bands: ['R', 'G', 'B'],
+};
+Map.addLayer(preNDVIRGB,  RGBvisualization, 'RGB - BEFORE (' + preStart + ' to ' + preEnd + ')', false);
+Map.addLayer(postNDVIRGB, RGBvisualization, 'RGB - AFTER ('  + postStart + ' to ' + postEnd + ')', false);
+Map.addLayer(preNDVI,  ndviViz, 'NDVI - BEFORE (' + preStart + ' to ' + preEnd + ')', false);
+Map.addLayer(postNDVI, ndviViz, 'NDVI - AFTER ('  + postStart + ' to ' + postEnd + ')', false);
+Map.addLayer(ndviDiff, dViz,    'ΔNDVI (post - pre)', false);
+Map.addLayer(harvestClass, classViz, 'Harvest (1=corn, 2=soy)', true);
+
+
+// -------------------- AREA STATS & EXPORTS -------------------
+// Use the union geometry of the chosen tile as the region for stats/exports.
+// This does not "clip" your layers; it only bounds the analysis window.
+var tileRegion = tileGeom;
+
+var areaHa = ee.Image.pixelArea().divide(10000).rename('ha');
+var cornHa = areaHa.updateMask(harvestCorn);
+var soyHa  = areaHa.updateMask(harvestSoy);
+
+var cornSum = ee.Number(cornHa.reduceRegion({
+  reducer: ee.Reducer.sum(), geometry: tileRegion, scale: 10, maxPixels: 1e13
+}).get('ha'));
+var soySum = ee.Number(soyHa.reduceRegion({
+  reducer: ee.Reducer.sum(), geometry: tileRegion, scale: 10, maxPixels: 1e13
+}).get('ha'));
+
+print('Harvested area in chosen tile (ha) — corn:', cornSum, 'soy:', soySum);
+
+// Export (bounded to the tile region for file size; layers themselves are un-clipped)
+// Export.image.toDrive({
+//   image: harvestClass.toInt8(),
+//   description: 'Harvest_MaizeSoy_BIG_TILE_' + preStart + '_' + postEnd,
+//   folder: exportFolder,
+//   fileNamePrefix: 'Harvest_MaizeSoy_BIG_TILE_' + preStart + '_' + postEnd,
+//   region: tileRegion,
+//   scale: exportScale,
+//   maxPixels: 1e13
+// });
+
+var diag = preNDVI.rename('NDVI_pre')
+  .addBands(postNDVI.rename('NDVI_post'))
+  .addBands(ndviDiff);
+// Export.image.toDrive({
+//   image: diag.float(),
+//   description: 'NDVI_stack_BIG_TILE_' + preStart + '_' + postEnd,
+//   folder: exportFolder,
+//   fileNamePrefix: 'NDVI_stack_BIG_TILE_' + preStart + '_' + postEnd,
+//   region: tileRegion,
+//   scale: 10,
+//   maxPixels: 1e13
+// });
+
+
