@@ -1,314 +1,161 @@
-Harvest detection for corn and soy in Sentinel 2 MGRS tiles
-Overview
+# Harvest Detection (Corn & Soy) Using Sentinel-2 MGRS Tiles
 
-This script detects harvested corn and soybean fields inside a single Sentinel 2 MGRS tile using NDVI change between two time windows.
+This repository contains a Google Earth Engine script that detects harvested corn and soybean fields based on NDVI change between two time windows. The workflow automatically selects the single Sentinel-2 MGRS tile that overlaps the user-drawn geometry the most, then processes the full tile footprint (no clipping) for consistent analysis.
 
-You draw an area of interest in the GEE Code Editor. The script then
+---
 
-Finds all Sentinel 2 tiles touching that geometry for the chosen period
+## Features
 
-Selects the single tile whose footprints overlap your geometry the most
+* Selects the dominant overlapping MGRS tile from your drawn geometry  
+* Computes NDVI for pre-harvest and post-harvest windows using the cleanest cloud-free scenes available  
+* Applies crop masks from USDA CDL to isolate corn and soybean fields  
+* Detects harvested pixels using NDVI thresholds and NDVI drop  
+* Removes speckle using connected component filtering  
+* Produces a harvest classification map for the full MGRS tile footprint  
+* Summarizes harvested area of corn and soy in hectares  
+* Optional exports of harvest class and NDVI diagnostic layers  
 
-Runs the full analysis on the entire footprint of that chosen tile
+---
 
-Estimates harvested area for corn and soy within that tile and reports areas in hectares
+## Data Sources
 
-Processing is intentionally done on the full tile footprint rather than clipping to the user geometry, so results are tile consistent and not influenced by the drawn shape.
+* **Sentinel-2 SR (Harmonized)**  
+  Collection: `COPERNICUS/S2_SR_HARMONIZED`
 
-Data sources
+* **Sentinel-2 Cloud Probability**  
+  Collection: `COPERNICUS/S2_CLOUD_PROBABILITY`
 
-The script uses the following Earth Engine collections
+* **USDA Cropland Data Layer (CDL)**  
+  Collection: `USDA/NASS/CDL`
 
-Sentinel 2 surface reflectance harmonized collection
+---
 
-ID COPERNICUS/S2_SR_HARMONIZED
+## User Parameters
 
-Sentinel 2 cloud probability collection
+These parameters control the analysis and are defined at the top of the script.
 
-ID COPERNICUS/S2_CLOUD_PROBABILITY
+### Time Windows
+Defines the two periods used for NDVI comparison.
 
-USDA Cropland Data Layer for crop masks
+* `preStart` / `preEnd`  
+  Dates when crop should still be green before harvest  
+* `postStart` / `postEnd`  
+  Dates after harvest when fields are expected to be bare
 
-ID USDA/NASS/CDL
+### NDVI Thresholds
+Used to decide whether a pixel qualifies as harvested.
 
-User inputs
+* `preMinNDVI`  
+  Minimum NDVI in the pre window  
+* `postMaxNDVI`  
+  Maximum NDVI in the post window  
+* `ndviDropThr`  
+  NDVI difference threshold `post minus pre`
 
-At the top of the script there is a user parameters section. You normally only need to adjust these values.
+### Cloud Masking
+* `cloudProbThresh`  
+  Cloud probability cutoff from S2 cloud probability images  
+  Lower values mean stricter cloud filtering
 
-Time windows
+### Patch Filtering
+* `minPatchPixels`  
+  Minimum connected component size to reduce speckle (10 m pixels)
 
-preStart and preEnd
+### CDL Crop Masking
+* `cdlYear`  
+  CDL year to be used for corn and soy maps  
+* `maskNDVIToCrops`  
+  Option to compute NDVI only on corn and soy pixels
 
-First time window before expected harvest
+### Export Options
+* `exportScale`  
+  Resolution for exported rasters  
+* `exportFolder`  
+  Drive folder name for exports
 
-Should represent green crop conditions
+---
 
-postStart and postEnd
+## Workflow
 
-Second time window after expected harvest
+### 1. Draw Geometry
+Draw a polygon named `geometry` in the GEE Code Editor.  
+This geometry is used only to choose the MGRS tile.
 
-Should represent mostly bare or very low vegetation cover
+### 2. Tile Selection
+The script finds all Sentinel-2 scenes intersecting your geometry and identifies the MGRS tile with the largest footprint overlap.
 
-Make sure the windows do not overlap and both are within the same broad harvest period for your region.
+### 3. Scene Selection and NDVI Computation
+For both pre and post windows:
 
-NDVI thresholds
+* Sentinel-2 SR scenes for the tile are filtered  
+* Sentinel-2 cloud probability is joined  
+* A clear-pixel fraction is computed  
+* The cleanest scene is selected  
+* NDVI and RGB layers are produced using cloud probability (or QA60) masking
 
-preMinNDVI
+If no valid scene exists, an empty placeholder NDVI image is returned.
 
-Minimum NDVI in the pre window for a pixel to be considered green crop
+### 4. Harvest Detection
+* Compute NDVI drop `post minus pre`  
+* Create masks for  
+  * Green before  
+  * Bare after  
+  * Strong NDVI drop  
+* Combine these to form a harvest candidate mask  
+* Mask separately with CDL corn and CDL soy layers  
+* Apply connected pixel filtering  
+* Build a harvest class raster  
+  * zero  no harvest  
+  * one  corn  
+  * two  soy
 
-postMaxNDVI
+### 5. Area Statistics
+Using the full tile footprint:
 
-Maximum NDVI in the post window for a pixel to be considered bare or harvested
+* Calculate pixel area in hectares  
+* Sum area of harvested corn  
+* Sum area of harvested soy  
+* Print results to the console
 
-ndviDropThr
+### 6. Visualization
+The script provides map layers for
 
-Maximum allowed value of the change NDVI post minus NDVI pre
+* RGB before  
+* RGB after  
+* NDVI before  
+* NDVI after  
+* NDVI change  
+* Harvest class
 
-Should be a negative value representing the drop in NDVI from pre to post
+### 7. Exports
+Two optional exports are included but commented out:
 
-There is a note in the script that the optimal NDVI change threshold needs more exploration. You are expected to tune these values for your region, season, and crop condition.
+* Harvest class image  
+* NDVI diagnostics stack
 
-Cloud masking
+To export, uncomment the corresponding `Export.image.toDrive` blocks.
 
-cloudProbThresh
+---
 
-Threshold on Sentinel 2 cloud probability (range zero to one hundred)
+## How to Use
 
-Lower values give stricter masking and cleaner scenes but may remove more pixels
+1. Open in Earth Engine Code Editor  
+2. Draw a polygon and rename it to `geometry`  
+3. Adjust user parameters at the top of the script  
+4. Run the script  
+5. View logs, inspect map layers, and tune thresholds  
+6. Enable exports when satisfied with results
 
-The script uses S2 cloud probability when available and falls back to QA60 bit masks when cloud probability is missing.
+---
 
-Patch filtering
+## Notes and Recommendations
 
-minPatchPixels
+* Tune `preMinNDVI`, `postMaxNDVI`, and `ndviDropThr` using local conditions  
+* Ensure time windows properly represent green crop state and post-harvest bare state  
+* Patch filtering helps remove isolated NDVI artifacts  
+* Since analysis is done over the full tile, results remain comparable when reusing settings over different geometries
 
-Minimum connected pixel count for accepted harvest patches
+## Author
 
-Used to remove speckle and tiny isolated detections
+Remote sensing agronomy workflow for operational harvest detection using Google Earth Engine.
 
-Values correspond to ten meter pixels
-
-CDL year and crop masking
-
-cdlYear
-
-Year of Cropland Data Layer used to label corn and soy
-
-If requested year is not available, the script falls back to the nearest available year in the collection
-
-maskNDVIToCrops
-
-Boolean flag
-
-When true, NDVI and NDVI change are considered only on pixels mapped as corn or soy in CDL
-
-When false, NDVI is computed everywhere and CDL is used only later to separate corn and soy detections
-
-Export settings
-
-exportScale
-
-Pixel size for exports in meters
-
-exportFolder
-
-Name of the folder in your Google Drive where images will be exported
-
-Exports are currently commented out. You can enable them once you are satisfied with the results.
-
-Geometry input and tile selection
-
-Draw a polygon named geometry in the GEE Code Editor
-
-The map is centered on this polygon
-
-The script finds all Sentinel 2 scenes that intersect your geometry during the union of the pre and post windows
-
-It lists all MGRS tiles for those scenes
-
-For each tile it computes the area of the intersection between
-
-the union of that tile footprint over the consolidated date range
-
-the user drawn geometry
-
-The tile with the largest intersecting area is selected
-
-The chosen tile ID and the overlapping area in hectares are printed in the Console. The outline of the chosen tile is drawn on the map.
-
-Although the geometry is used to choose a tile, all further NDVI and harvest calculations are performed over the full tile footprint, not the original geometry. The tile geometry is only used as a region for statistics and exports.
-
-Cleanest scene and NDVI computation
-
-For each time window (pre and post) and for the chosen tile, the script
-
-Filters Sentinel 2 surface reflectance images by dates and tile ID
-
-Filters S2 cloud probability images by the same dates and tile ID
-
-Joins the two collections by system index
-
-For each joined image, computes the fraction of clear pixels within the tile union geometry, based on the cloud probability threshold
-
-Selects the image with the highest clear fraction when cloud probability is available
-
-If no cloud probability image is present, selects the scene with the smallest CLOUDY_PIXEL_PERCENTAGE value
-
-From the selected scene it then
-
-Computes NDVI using B8 and B4
-
-Builds an RGB image using B4, B3, B2
-
-Applies either the cloud probability mask or QA60 cloud and cirrus bits
-
-Adds metadata about the selected scene date, ID, mask method, and cloudiness
-
-If no suitable scene is found in a window, an empty NDVI and RGB stack is returned so downstream logic does not fail.
-
-Harvest detection logic
-
-After computing NDVI for both windows on the full tile footprint, the script
-
-Computes NDVI change as NDVI post minus NDVI pre
-
-Optionally masks NDVI and NDVI change to CDL corn and soy pixels when maskNDVIToCrops is true
-
-Builds three logical conditions for each pixel
-
-Pre green condition NDVI pre greater than or equal to preMinNDVI
-
-Post bare condition NDVI post less than or equal to postMaxNDVI
-
-Strong drop condition NDVI change less than or equal to ndviDropThr
-
-A pixel is considered a harvest candidate when all three conditions are true
-
-The candidate mask is combined with CDL crop masks to produce
-
-harvestCorn
-
-harvestSoy
-
-A minimum patch size filter is applied to each crop detection using connected pixel count
-
-A class image is built
-
-value zero no harvest
-
-value one harvested corn
-
-value two harvested soy
-
-The final harvest class image is clipped by the tile geometry only for display or export region control. Internally the analysis already covers the full tile footprint.
-
-Visualization layers
-
-The script adds several layers to the map
-
-Pre window RGB true color
-
-Post window RGB true color
-
-Pre window NDVI
-
-Post window NDVI
-
-NDVI change image
-
-Harvest class image with separate colors for corn and soy
-
-These layers are created from the full tile footprint with cloud masks applied.
-
-Area statistics
-
-To summarize harvested area in the chosen tile, the script
-
-Builds a pixel area image in hectares
-
-Applies masks for harvested corn and harvested soy
-
-Sums area values over the tile geometry using ten meter scale
-
-Prints harvested area for corn and soy in hectares to the Console
-
-This gives you a quick estimate of harvested corn and soy area within the selected tile.
-
-Exports
-
-Two image exports are prepared and commented out
-
-Harvest class image as an integer raster with classes zero one two
-
-Diagnostic NDVI stack with NDVI pre, NDVI post, and NDVI change
-
-To enable exports
-
-Uncomment the Export.image.toDrive calls near the end of the script
-
-Check that exportFolder exists in your Google Drive or adjust the folder name
-
-Run the script and monitor the Tasks panel in GEE
-
-Exports are bounded by the tile geometry for manageable file sizes but the internal processing remains tile wide.
-
-How to run
-
-Open the script in the Earth Engine Code Editor
-
-Draw or import a polygon and rename it to geometry
-
-Adjust the user parameters section at the top
-
-Dates for pre and post windows
-
-NDVI thresholds
-
-Cloud probability threshold
-
-Patch size threshold
-
-CDL year
-
-Optionally set maskNDVIToCrops to true if you want NDVI logic restricted to CDL corn and soy
-
-Run the script
-
-Inspect
-
-Printed logs for chosen tile ID and dates of selected scenes
-
-Map layers for NDVI, NDVI change, and harvest classes
-
-Printed harvested areas in the Console
-
-Once satisfied, enable exports and rerun to generate output rasters
-
-Tuning guidance
-
-Some practical tips for tuning
-
-Time windows
-
-Choose pre window when crops are fully green and close to peak canopy
-
-Choose post window after harvest but before significant regrowth or residue green up
-
-NDVI thresholds
-
-Start with moderately strict thresholds for green and bare conditions
-
-Inspect histograms or map values over representative fields to refine thresholds
-
-NDVI drop threshold
-
-Larger drops are more conservative and reduce false positives but may miss partial harvest or dry down only
-
-Smaller drops increase sensitivity but risk cloud shadow or other noise triggering detections
-
-Patch size
-
-Set minPatchPixels according to minimum field size you care about
-
-Because the script works at tile scale, you can reuse the same configuration over larger regions by simply changing the geometry and re running, while keeping a consistent detection logic per tile.
